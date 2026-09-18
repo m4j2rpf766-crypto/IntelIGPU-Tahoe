@@ -6,6 +6,13 @@
 
 当前实验环境：Intel PCI `8086:46a3`，macOS `25G83`，x86_64，内置 1920×1080 / 144 Hz 显示链路。其他机型、系统版本、外接显示、动态切换模式和睡眠唤醒没有通用支持保证。
 
+## 已实现的能力
+
+- **桌面约 120 fps 及以上的实际刷新表现**：内屏工作在 144 Hz，历史桌面拖动测得约 119–127 fps（包括 126.08 / 127.05 fps）。这些是特定场景的实际新帧率，不是所有应用的持续帧率保证；其他固定场景曾测得约 95.94 fps。
+- **剪映 H.264 视频硬解预览及导出流程中的硬解加速**：用户实测反馈已实现。独立 H.264 硬解测试 30/30 帧与软件参考像素一致；已采样的剪映导出现场确认素材硬解参与。这里的“硬解导出”指素材解码阶段使用硬件加速，输出 H.264 的硬编码尚未验证成功。
+
+详细证据层级和限制见 [已实现能力](docs/CAPABILITIES.md)。
+
 ## 状态与入口
 
 - [当前状态与验证边界](CURRENT-STATE.md)
@@ -23,3 +30,5 @@ HEVC 错误路径已加入错误返回、上下文隔离和有界资源隔离；
 ## English
 
 Experimental source snapshot for Intel Alder Lake iGPU compatibility on macOS Tahoe. Includes display/backlight glue, Metal compatibility, video discovery, an HEVC service backend, and bounded error recovery. Requires locally supplied compatible Apple components; no Apple binaries are distributed. Not a turnkey installer or a complete replacement driver. Real HEVC first-frame corruption and desktop GPU stability remain unresolved. See the build and runtime documents before experimenting.
+
+Demonstrated desktop dragging reaches approximately 119–127 fps on the 144 Hz internal display. The user also reports H.264 hardware-decoded preview and decode-accelerated export in Jianying. Hardware decoding during export does not establish H.264 hardware encoding support; see the capability notes for evidence boundaries.
