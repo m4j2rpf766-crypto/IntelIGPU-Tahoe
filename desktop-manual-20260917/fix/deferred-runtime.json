@@ -1,0 +1,9 @@
+{
+  "source_sha256": "ae99582bd5a945494ee684d339ac1abd0526828bcd3ea981239c0fd38f794d47",
+  "candidate_sha256": "095e4be1ab651df0db7dc660ede15527e75218995441f63d1ce4c49040017c7e",
+  "deferred_call_file_offset": "0x246b5",
+  "deferred_call": "IOService::registerService(unsigned int)",
+  "functional_text_change_bytes": 6,
+  "candidate_uuid": "8901b5893f935785fbf615d25e91632c",
+  "automatic_personalities": 0
+}

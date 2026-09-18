@@ -1,0 +1,12 @@
+**/build/
+**/tests/
+**/__pycache__/
+*.pyc
+*.o
+*.dylib
+*.kext/
+*.dSYM/
+.DS_Store
+/build/
+/local/
+/desktop-manual-20260917/fix/manual-gate/control
