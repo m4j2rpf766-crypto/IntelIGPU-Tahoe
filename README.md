@@ -1,6 +1,6 @@
 # IntelIGPU-Tahoe
 
-面向 macOS Tahoe 的实验性 Intel Alder Lake 核显兼容源码，包含显示接管、背光、Metal 兼容层、视频能力发布、HEVC 服务后端及故障回收。
+面向 macOS Tahoe 的实验性 Intel Alder Lake 核显兼容源码，已在目标机器支持 Metal 基础硬件加速、显示接管、背光、视频能力发布、HEVC 服务后端及故障回收。
 
 **这是依赖用户本地 Apple 驱动的研究项目，不是完整独立 GPU 驱动，也不是可直接安装的发行包。** 仓库不分发 Apple 二进制、修改后的 Apple 驱动、EFI 配置或个人诊断数据。
 
@@ -8,6 +8,7 @@
 
 ## 已实现的能力
 
+- **Metal 已支持并用于实际桌面与应用路径**：系统可使用核显 Metal 设备完成 WindowServer 桌面合成、基础纹理/管线/命令提交，以及剪映等已测试应用所需的兼容路径。该结论指已验证的兼容范围；通用独立 Stencil8、动态着色器库、部分新 Metal 特性和长期稳定性仍有限制。
 - **桌面约 120 fps 及以上的实际刷新表现**：内屏工作在 144 Hz，历史桌面拖动测得约 119–127 fps（包括 126.08 / 127.05 fps）。这些是特定场景的实际新帧率，不是所有应用的持续帧率保证；其他固定场景曾测得约 95.94 fps。
 - **剪映 H.264 视频硬解预览及导出流程中的硬解加速**：用户实测反馈已实现。独立 H.264 硬解测试 30/30 帧与软件参考像素一致；已采样的剪映导出现场确认素材硬解参与。这里的“硬解导出”指素材解码阶段使用硬件加速，输出 H.264 的硬编码尚未验证成功。
 
@@ -29,6 +30,6 @@ HEVC 错误路径已加入错误返回、上下文隔离和有界资源隔离；
 
 ## English
 
-Experimental source snapshot for Intel Alder Lake iGPU compatibility on macOS Tahoe. Includes display/backlight glue, Metal compatibility, video discovery, an HEVC service backend, and bounded error recovery. Requires locally supplied compatible Apple components; no Apple binaries are distributed. Not a turnkey installer or a complete replacement driver. Real HEVC first-frame corruption and desktop GPU stability remain unresolved. See the build and runtime documents before experimenting.
+Experimental source snapshot for Intel Alder Lake iGPU compatibility on macOS Tahoe. Metal hardware acceleration is supported within the validated compatibility scope and is used by the desktop compositor and tested application paths. The project also includes display/backlight glue, video discovery, an HEVC service backend, and bounded error recovery. Requires locally supplied compatible Apple components; no Apple binaries are distributed. Not a turnkey installer or a complete replacement driver. General standalone Stencil8, dynamic shader libraries, some newer Metal features, real HEVC first-frame corruption, and desktop GPU stability remain unresolved.
 
 Demonstrated desktop dragging reaches approximately 119–127 fps on the 144 Hz internal display. The user also reports H.264 hardware-decoded preview and decode-accelerated export in Jianying. Hardware decoding during export does not establish H.264 hardware encoding support; see the capability notes for evidence boundaries.
