@@ -13,3 +13,5 @@ cp Info.plist "$out/Info.plist"
 
 codesign --force --sign - build/ReimsVideoDiscovery.kext
 codesign --verify --deep --strict build/ReimsVideoDiscovery.kext
+python3 ../../scripts/write-kext-receipt.py \
+ build/ReimsVideoDiscovery.kext ReimsVideoDiscovery video-discovery-current.json

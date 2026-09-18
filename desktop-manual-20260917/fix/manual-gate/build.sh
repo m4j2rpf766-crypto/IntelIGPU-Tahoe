@@ -21,3 +21,5 @@ cp Info.plist "$contents/Info.plist"
 codesign --force --sign - build/ReimsADLManualActivation.kext
 codesign --verify --deep --strict build/ReimsADLManualActivation.kext
 plutil -lint "$contents/Info.plist"
+python3 ../../../scripts/write-kext-receipt.py \
+ build/ReimsADLManualActivation.kext ReimsADLManualActivation ../manual-gate-current.json

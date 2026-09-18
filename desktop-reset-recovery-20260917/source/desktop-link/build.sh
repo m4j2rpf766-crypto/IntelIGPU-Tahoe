@@ -23,5 +23,9 @@ xcrun clang++ -O2 -g -arch x86_64 -mmacosx-version-min=13.0 -nostdlib \
     build/ReimsADLDesktopLink.o build/graphics_control.o build/intel_framebuffer.o build/module.o -lkmod -lkmodc++ \
     -o "$contents/MacOS/ReimsADLDesktopLink"
 cp Info.plist "$contents/Info.plist"
+codesign --force --sign - build/ReimsADLDesktopLink.kext
+codesign --verify --deep --strict build/ReimsADLDesktopLink.kext
 plutil -lint "$contents/Info.plist"
 file "$contents/MacOS/ReimsADLDesktopLink"
+python3 ../../../scripts/write-kext-receipt.py \
+ build/ReimsADLDesktopLink.kext ReimsADLDesktopLink desktop-link-current.json

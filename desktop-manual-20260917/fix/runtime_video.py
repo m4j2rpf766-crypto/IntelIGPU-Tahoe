@@ -2,15 +2,17 @@
 import datetime,hashlib,json,pathlib,plistlib,time
 BASE=pathlib.Path(__file__).resolve().parent
 BUNDLE=BASE.parents[1]/'video-decode-candidate/manual-runtime-discovery-20260917/build/ReimsVideoDiscovery.kext'
-UUID='575CF986C2763C04B72989D844964F25'
+RECEIPT_PATH=BASE.parents[1]/'video-decode-candidate/manual-runtime-discovery-20260917/video-discovery-current.json'
+RECEIPT=json.loads(RECEIPT_PATH.read_text())
+UUID=RECEIPT['uuid'].upper().replace('-','')
 IDENTIFIER='lab.reims.ReimsVideoDiscovery'
-HASHES={'Contents/MacOS/ReimsVideoDiscovery':'02164bdaff04bd59f086f5faa76e035e0d1b478b30a2b32927409fcb637f3241','Contents/Info.plist':'e1b44e317e0b1d565bf84da8c5a4cdaaea6fd6a7725fee79ecb9c5e81ce02829'}
+HASHES=RECEIPT['hashes']
 def verify_bundle(run):
     for name,expected in HASHES.items():
         assert hashlib.sha256((BUNDLE/name).read_bytes()).hexdigest()==expected,'VideoDiscovery package changed: '+name
     run(['codesign','--verify','--deep','--strict',BUNDLE])
     info=plistlib.loads((BUNDLE/'Contents/Info.plist').read_bytes())
-    assert info['CFBundleIdentifier']==IDENTIFIER and info['CFBundleVersion']=='0.1.3'
+    assert info['CFBundleIdentifier']==IDENTIFIER and info['CFBundleVersion']==RECEIPT['version']
     personalities=info['IOKitPersonalities'];assert len(personalities)==1
     return next(iter(personalities.values()))['VideoProperties']
 def published(pci,objects,properties):
@@ -39,7 +41,7 @@ def ensure_video(run,registry,objects,logdir):
     while not published(pci,objects,properties):
         assert time.monotonic()<deadline,'VideoDiscovery loaded but did not publish expected properties; inspect evidence, do not repeat display commit'
         time.sleep(.25);pci=registry()
-    record=dict(verified_at=datetime.datetime.now().astimezone().isoformat(),bundle=str(BUNDLE),version='0.1.3',uuid=UUID,hashes=HASHES,load_requested=needed,published=True,properties=properties)
+    record=dict(verified_at=datetime.datetime.now().astimezone().isoformat(),bundle=str(BUNDLE),version=RECEIPT['version'],uuid=UUID,hashes=HASHES,load_requested=needed,published=True,properties=properties)
     (logdir/'video-runtime.json').write_text(json.dumps(record,indent=2)+'\n')
     print('Video runtime ready: approved VideoDiscovery 0.1.3 and all expected accelerator video properties verified. Encoding/pixels still require validation.',flush=True)
     return pci

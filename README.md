@@ -18,6 +18,7 @@
 
 - [当前状态与验证边界](CURRENT-STATE.md)
 - [源码构建](docs/BUILD.md)
+- [同硬件部署与启动](docs/DEPLOY-SAME-HARDWARE.md)
 - [运行时组件及视频发布加载](docs/RUNTIME.md)
 - [源码结构与发布范围](docs/SOURCE-MAP.md)
 - [第三方许可证](THIRD_PARTY_NOTICES.md)

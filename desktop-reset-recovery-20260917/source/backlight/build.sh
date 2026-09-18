@@ -20,5 +20,9 @@ xcrun clang++ -O2 -g -arch x86_64 -mmacosx-version-min=13.0 -nostdlib \
     build/ReimsADLBacklight.o build/module.o -lkmod -lkmodc++ \
     -o "$contents/MacOS/ReimsADLBacklight"
 cp Info.plist "$contents/Info.plist"
+codesign --force --sign - build/ReimsADLBacklight.kext
+codesign --verify --deep --strict build/ReimsADLBacklight.kext
 plutil -lint "$contents/Info.plist"
 file "$contents/MacOS/ReimsADLBacklight"
+python3 ../../../scripts/write-kext-receipt.py \
+ build/ReimsADLBacklight.kext ReimsADLBacklight backlight-current.json

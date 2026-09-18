@@ -3,9 +3,11 @@
 import argparse, datetime, hashlib, json, os, pathlib, plistlib, subprocess, time
 from runtime_video import ensure_video, verify_bundle
 BASE=pathlib.Path(__file__).resolve().parent
+ROOT=BASE.parents[1]
 CONTROL=BASE/'manual-gate/control'
 NATIVE=pathlib.Path('/Library/Extensions/ReimsTGLBoot.kext')
 LINK=pathlib.Path('/Library/Extensions/ReimsADLDesktopLink.kext')
+LINK_RECEIPT=ROOT/'desktop-reset-recovery-20260917/source/desktop-link/desktop-link-current.json'
 def run(args,timeout=10):
     try:
         return subprocess.check_output([str(x) for x in args],stderr=subprocess.STDOUT,timeout=timeout)
@@ -26,25 +28,29 @@ def preflight(phase):
     assert run(['sw_vers','-buildVersion']).strip()==b'25G83'
     receipt=json.loads((BASE/'deferred-runtime.json').read_text())
     assert hashlib.sha256((NATIVE/'Contents/MacOS/AppleIntelTGLGraphics').read_bytes()).hexdigest()==receipt['candidate_sha256']
-    assert hashlib.sha256((LINK/'Contents/MacOS/ReimsADLDesktopLink').read_bytes()).hexdigest()=='239dd2df4867059451b1707ea1fbdf1bd60f69776f04855dbdd154c12c35006a'
+    link_receipt=json.loads(LINK_RECEIPT.read_text())
+    link_hash=link_receipt['hashes']['Contents/MacOS/ReimsADLDesktopLink']
+    assert hashlib.sha256((LINK/'Contents/MacOS/ReimsADLDesktopLink').read_bytes()).hexdigest()==link_hash,'Installed DesktopLink differs from this checkout build receipt'
     loaded=run(['kmutil','showloaded']).decode().upper()
     uuid=receipt['candidate_uuid'].upper()
     assert uuid in loaded.replace('-',''),'Approved deferred runtime is not loaded; do not use the old runtime'
+    link_uuid=link_receipt['uuid'].upper().replace('-','')
     gate_receipt=json.loads((BASE/'manual-gate-current.json').read_text())
     assert gate_receipt['uuid'].upper().replace('-','') in loaded.replace('-',''),'Corrected manual controller is not loaded'
     gate_binary=pathlib.Path('/Library/Extensions/ReimsADLManualActivation.kext/Contents/MacOS/ReimsADLManualActivation')
-    assert hashlib.sha256(gate_binary.read_bytes()).hexdigest()==gate_receipt['sha256'],'Manual controller on disk changed'
+    gate_hash=gate_receipt['hashes']['Contents/MacOS/ReimsADLManualActivation']
+    assert hashlib.sha256(gate_binary.read_bytes()).hexdigest()==gate_hash,'Manual controller on disk differs from this checkout build receipt'
     pci=registry()
     assert pci['device-id']==bytes.fromhex('ffff0000'),'Startup isolation changed'
     # Check the media package before any display mutation. Loading/matching
     # it occurs only after the accelerator is explicitly published.
     verify_bundle(run)
-    if phase=='prepare' and '9F0C79A353D830FABD5E94A604A04F3F' not in loaded.replace('-',''):
+    if phase=='prepare' and link_uuid not in loaded.replace('-',''):
         assert not objects(pci,'IntelAccelerator'),'Runtime already exists; inspect instead of preparing twice'
         run(['codesign','--verify','--deep','--strict',LINK])
         print(run(['kmutil','load','-p',LINK,'--load-style','start-only'],30).decode())
         loaded=run(['kmutil','showloaded']).decode().upper()
-    assert '9F0C79A353D830FABD5E94A604A04F3F' in loaded.replace('-',''),'Reset recovery DesktopLink 0.6.23 is not loaded'
+    assert link_uuid in loaded.replace('-',''),'This checkout DesktopLink build is not loaded'
     return pci
 def hidden_ready(pci):
     accelerators=objects(pci,'IntelAccelerator')

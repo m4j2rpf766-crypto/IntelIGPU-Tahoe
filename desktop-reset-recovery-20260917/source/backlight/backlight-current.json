@@ -1,0 +1,10 @@
+{
+  "bundle": "ReimsADLBacklight.kext",
+  "identifier": "lab.reims.ReimsADLBacklight",
+  "version": "0.1.2",
+  "uuid": "474E5023-6733-379E-9A56-FDDCBBBD566C",
+  "hashes": {
+    "Contents/MacOS/ReimsADLBacklight": "4053ada4783b842062fe203086674c8baab4ebc426487850b20f57cc06c05eb8",
+    "Contents/Info.plist": "e2e094185b39042f46d7d2ffb74ea917fce85907a2ebf93a569b3bbac405e0d7"
+  }
+}
