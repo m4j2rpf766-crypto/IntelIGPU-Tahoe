@@ -25,7 +25,7 @@ class Cases(unittest.TestCase):
             raise AssertionError(args)
         with tempfile.TemporaryDirectory() as d,patch.object(v,'verify_bundle',return_value=PROPS),patch.object(v.time,'monotonic',side_effect=[0,10,20]):
             try:v.ensure_video(run,lambda:copy.deepcopy(state['pci']),objects,pathlib.Path(d));error=None
-            except AssertionError as e:error=str(e)
+            except RuntimeError as e:error=str(e)
         return calls,error
     def test_already_ready_does_not_load(self):
         calls,error=self.execute(True,True);self.assertIsNone(error);self.assertFalse(any(x[:2]==['kmutil','load'] for x in calls))
