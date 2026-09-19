@@ -16,6 +16,14 @@
 
 ## 状态与入口
 
+完成同硬件构建、放置及正常 macOS 审批后，每次重启只运行一个状态感知入口：
+
+```sh
+sudo ./igpu-start
+```
+
+它会自动识别冷启动、已准备、已发布及仅缺视频状态，不重复已经完成的显示提交。命令成功仍须验证当前 WindowServer、可见桌面和实际完成翻页增长。
+
 - [当前状态与验证边界](CURRENT-STATE.md)
 - [源码构建](docs/BUILD.md)
 - [同硬件部署与启动](docs/DEPLOY-SAME-HARDWARE.md)
@@ -32,5 +40,7 @@ HEVC 错误路径已加入错误返回、上下文隔离和有界资源隔离；
 ## English
 
 Experimental source snapshot for Intel Alder Lake iGPU compatibility on macOS Tahoe. Metal hardware acceleration is supported within the validated compatibility scope and is used by the desktop compositor and tested application paths. The project also includes display/backlight glue, video discovery, an HEVC service backend, and bounded error recovery. Requires locally supplied compatible Apple components; no Apple binaries are distributed. Not a turnkey installer or a complete replacement driver. General standalone Stencil8, dynamic shader libraries, some newer Metal features, real HEVC first-frame corruption, and desktop GPU stability remain unresolved.
+
+After the same-hardware build, placement, and normal macOS approval steps, runtime startup uses one state-aware command: `sudo ./igpu-start`.
 
 Demonstrated desktop dragging reaches approximately 119–127 fps on the 144 Hz internal display. The user also reports H.264 hardware-decoded preview and decode-accelerated export in Jianying. Hardware decoding during export does not establish H.264 hardware encoding support; see the capability notes for evidence boundaries.
