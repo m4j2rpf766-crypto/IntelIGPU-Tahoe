@@ -1,115 +1,368 @@
 #!/usr/bin/env python3
-"""Explicit session-only activation. Never installed as a launch service."""
-import argparse, datetime, hashlib, json, os, pathlib, plistlib, subprocess, time
+"""Single explicit session-only GPU startup. Never installed as a launch service."""
+import argparse
+import contextlib
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import pathlib
+import plistlib
+import subprocess
+import time
+
 from runtime_video import ensure_video, verify_bundle
-BASE=pathlib.Path(__file__).resolve().parent
-ROOT=BASE.parents[1]
-CONTROL=BASE/'manual-gate/control'
-NATIVE=pathlib.Path('/Library/Extensions/ReimsTGLBoot.kext')
-LINK=pathlib.Path('/Library/Extensions/ReimsADLDesktopLink.kext')
-LINK_RECEIPT=ROOT/'desktop-reset-recovery-20260917/source/desktop-link/desktop-link-current.json'
-def run(args,timeout=10):
+
+BASE = pathlib.Path(__file__).resolve().parent
+ROOT = BASE.parents[1]
+CONTROL = BASE / "manual-gate/control"
+NATIVE = pathlib.Path("/Library/Extensions/ReimsTGLBoot.kext")
+GATE = pathlib.Path("/Library/Extensions/ReimsADLManualActivation.kext")
+LINK = pathlib.Path("/Library/Extensions/ReimsADLDesktopLink.kext")
+METAL = pathlib.Path("/Library/GPUBundles/ReimsTahoeTGLGraphicsMTLDriver.bundle")
+LINK_RECEIPT = ROOT / "desktop-reset-recovery-20260917/source/desktop-link/desktop-link-current.json"
+LOCK = pathlib.Path("/private/var/run/reims-igpu-start.lock")
+
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+def run(args, timeout=10):
     try:
-        return subprocess.check_output([str(x) for x in args],stderr=subprocess.STDOUT,timeout=timeout)
-    except subprocess.CalledProcessError as error:
-        print(error.output.decode(errors="replace"),flush=True)
+        return subprocess.check_output(
+            [str(value) for value in args], stderr=subprocess.STDOUT, timeout=timeout
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        output = getattr(error, "output", None)
+        if output:
+            print(output.decode(errors="replace"), flush=True)
         raise
+
+
 def registry():
-    return plistlib.loads(run(['ioreg','-r','-n','GFX0','-l','-a']))[0]
-def objects(root,class_name):
-    result=[]
-    if root.get('IOObjectClass')==class_name:result.append(root)
-    for child in root.get('IORegistryEntryChildren',[]):result.extend(objects(child,class_name))
+    values = plistlib.loads(run(["ioreg", "-r", "-n", "GFX0", "-l", "-a"]))
+    require(len(values) == 1, "Expected exactly one GFX0 registry root")
+    return values[0]
+
+
+def objects(root, class_name):
+    result = []
+    if root.get("IOObjectClass") == class_name:
+        result.append(root)
+    for child in root.get("IORegistryEntryChildren", []):
+        result.extend(objects(child, class_name))
     return result
-def action(name,timeout=10):
-    print(run([CONTROL,name],timeout).decode(),flush=True)
-def preflight(phase):
-    assert os.geteuid()==0,'Run as administrator'
-    assert run(['sw_vers','-buildVersion']).strip()==b'25G83'
-    receipt=json.loads((BASE/'deferred-runtime.json').read_text())
-    assert hashlib.sha256((NATIVE/'Contents/MacOS/AppleIntelTGLGraphics').read_bytes()).hexdigest()==receipt['candidate_sha256']
-    link_receipt=json.loads(LINK_RECEIPT.read_text())
-    link_hash=link_receipt['hashes']['Contents/MacOS/ReimsADLDesktopLink']
-    assert hashlib.sha256((LINK/'Contents/MacOS/ReimsADLDesktopLink').read_bytes()).hexdigest()==link_hash,'Installed DesktopLink differs from this checkout build receipt'
-    loaded=run(['kmutil','showloaded']).decode().upper()
-    uuid=receipt['candidate_uuid'].upper()
-    assert uuid in loaded.replace('-',''),'Approved deferred runtime is not loaded; do not use the old runtime'
-    link_uuid=link_receipt['uuid'].upper().replace('-','')
-    gate_receipt=json.loads((BASE/'manual-gate-current.json').read_text())
-    assert gate_receipt['uuid'].upper().replace('-','') in loaded.replace('-',''),'Corrected manual controller is not loaded'
-    gate_binary=pathlib.Path('/Library/Extensions/ReimsADLManualActivation.kext/Contents/MacOS/ReimsADLManualActivation')
-    gate_hash=gate_receipt['hashes']['Contents/MacOS/ReimsADLManualActivation']
-    assert hashlib.sha256(gate_binary.read_bytes()).hexdigest()==gate_hash,'Manual controller on disk differs from this checkout build receipt'
-    pci=registry()
-    assert pci['device-id']==bytes.fromhex('ffff0000'),'Startup isolation changed'
-    # Check the media package before any display mutation. Loading/matching
-    # it occurs only after the accelerator is explicitly published.
-    verify_bundle(run)
-    if phase=='prepare' and link_uuid not in loaded.replace('-',''):
-        assert not objects(pci,'IntelAccelerator'),'Runtime already exists; inspect instead of preparing twice'
-        run(['codesign','--verify','--deep','--strict',LINK])
-        print(run(['kmutil','load','-p',LINK,'--load-style','start-only'],30).decode())
-        loaded=run(['kmutil','showloaded']).decode().upper()
-    assert link_uuid in loaded.replace('-',''),'This checkout DesktopLink build is not loaded'
-    return pci
+
+
+def action(name, timeout=10):
+    print(run([CONTROL, name], timeout).decode(), flush=True)
+
+
+def sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def verify_receipt_bundle(bundle, receipt):
+    for relative, expected in receipt["hashes"].items():
+        require(
+            sha256(bundle / relative) == expected,
+            f"Installed {receipt['identifier']} differs from this checkout build receipt: {relative}",
+        )
+    run(["codesign", "--verify", "--deep", "--strict", bundle], 30)
+
+
+def loaded_entry(loaded, identifier, expected_uuid, required=True):
+    lines = [line for line in loaded.splitlines() if identifier in line]
+    if not lines:
+        require(not required, f"Required kernel component is not loaded: {identifier}")
+        return False
+    require(len(lines) == 1, f"Expected one loaded {identifier}, found {len(lines)}")
+    normalized = lines[0].upper().replace("-", "")
+    require(
+        expected_uuid.upper().replace("-", "") in normalized,
+        f"Unexpected loaded version of {identifier}",
+    )
+    return True
+
+
+def link_ready(pci):
+    links = objects(pci, "ReimsADLDesktopLink")
+    return (
+        len(links) == 1
+        and links[0].get("RCSADLPWorkaroundLive") is True
+        and links[0].get("RCSResetPSMIRegistered") is True
+    )
+
+
 def hidden_ready(pci):
-    accelerators=objects(pci,'IntelAccelerator')
-    return len(accelerators)==1 and not (accelerators[0]['IOServiceState']&3) and pci['IOServiceBusyState']==0
-parser=argparse.ArgumentParser()
-parser.add_argument('phase',choices=['prepare','commit','video'])
-args=parser.parse_args()
-pci=preflight(args.phase)
-logdir=BASE/('session-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+args.phase)
-logdir.mkdir()
-(logdir/'before.plist').write_bytes(plistlib.dumps(pci))
-if args.phase=='prepare':
-    assert not objects(pci,'IntelAccelerator'),'A runtime already exists; inspect it instead of starting twice'
-    # Preflight loaded only the approved link code, without PCI matching.
-    if not objects(pci,'ReimsADLManualMatchProbe'):
-        action('SelfTest')
-    deadline=time.monotonic()+5
-    while not objects(registry(),'ReimsADLManualMatchProbe'):
-        assert time.monotonic()<deadline,'Read-only matching self-test did not appear'
-        time.sleep(.25)
-    action('PrepareRuntime',50)
-    deadline=time.monotonic()+45
+    accelerators = objects(pci, "IntelAccelerator")
+    return (
+        len(accelerators) == 1
+        and not (accelerators[0].get("IOServiceState", 0) & 3)
+        and pci.get("IOServiceBusyState") == 0
+    )
+
+
+def runtime_state(pci):
+    accelerators = objects(pci, "IntelAccelerator")
+    firmware = objects(pci, "IONDRVFramebuffer")
+    native = objects(pci, "ReimsIntelADLFramebuffer")
+    if not accelerators:
+        require(len(firmware) == 1, "Cold startup requires exactly one firmware framebuffer")
+        require(not native, "Native framebuffer exists without an IntelAccelerator")
+        return "cold"
+    require(len(accelerators) == 1, "Expected exactly one IntelAccelerator")
+    state = accelerators[0].get("IOServiceState", 0)
+    if state & 2:
+        require(len(native) == 1, "Published accelerator lacks exactly one native framebuffer")
+        require(link_ready(pci), "Published accelerator lacks a ready DesktopLink")
+        return "published"
+    require(hidden_ready(pci), "IntelAccelerator is neither hidden-ready nor published")
+    require(
+        len(firmware) == 1 and not native,
+        "Prepared state must retain only the firmware framebuffer",
+    )
+    require(link_ready(pci), "Prepared accelerator lacks reset/display preparation")
+    return "prepared"
+
+
+def preflight():
+    require(os.geteuid() == 0, "Run the single startup command as administrator")
+    require(
+        run(["sw_vers", "-buildVersion"]).strip() == b"25G83",
+        "Unsupported macOS build",
+    )
+
+    runtime_receipt = json.loads((BASE / "deferred-runtime.json").read_text())
+    gate_receipt = json.loads((BASE / "manual-gate-current.json").read_text())
+    link_receipt = json.loads(LINK_RECEIPT.read_text())
+    require(
+        sha256(NATIVE / "Contents/MacOS/AppleIntelTGLGraphics")
+        == runtime_receipt["candidate_sha256"],
+        "Installed deferred TGL runtime differs from this checkout receipt",
+    )
+    run(["codesign", "--verify", "--deep", "--strict", NATIVE], 30)
+    verify_receipt_bundle(GATE, gate_receipt)
+    verify_receipt_bundle(LINK, link_receipt)
+    run(["codesign", "--verify", "--deep", "--strict", METAL], 30)
+    verify_bundle(run)
+
+    loaded = run(["kmutil", "showloaded"]).decode()
+    loaded_entry(
+        loaded,
+        "com.apple.driver.AppleIntelTGLGraphics",
+        runtime_receipt["candidate_uuid"],
+    )
+    loaded_entry(
+        loaded,
+        gate_receipt["identifier"],
+        gate_receipt["uuid"],
+    )
+    pci = registry()
+    require(
+        pci.get("device-id") == bytes.fromhex("ffff0000"),
+        "FFFF startup isolation changed",
+    )
+
+    link_loaded = loaded_entry(
+        loaded,
+        link_receipt["identifier"],
+        link_receipt["uuid"],
+        required=False,
+    )
+    if not link_loaded:
+        require(
+            runtime_state(pci) == "cold",
+            "DesktopLink is absent after GPU initialization; preserve evidence",
+        )
+        print(
+            run(["kmutil", "load", "-p", LINK, "--load-style", "start-only"], 30).decode(),
+            flush=True,
+        )
+        loaded = run(["kmutil", "showloaded"]).decode()
+        loaded_entry(loaded, link_receipt["identifier"], link_receipt["uuid"])
+    return registry()
+
+
+def prepare_runtime(pci):
+    require(runtime_state(pci) == "cold", "Prepare requested outside cold startup state")
+    if not objects(pci, "ReimsADLManualMatchProbe"):
+        action("SelfTest")
+    deadline = time.monotonic() + 5
+    while not objects(registry(), "ReimsADLManualMatchProbe"):
+        require(
+            time.monotonic() < deadline,
+            "Read-only matching self-test did not appear",
+        )
+        time.sleep(0.25)
+
+    action("PrepareRuntime", 50)
+    deadline = time.monotonic() + 45
     while True:
-        pci=registry()
-        a=objects(pci,'IntelAccelerator')
-        assert not any(x['IOServiceState']&2 for x in a),'Premature publication; stop and inspect'
-        if hidden_ready(pci):break
-        assert time.monotonic()<deadline,'Hidden initialization did not finish; no display commit attempted'
+        pci = registry()
+        accelerators = objects(pci, "IntelAccelerator")
+        require(
+            not any(value.get("IOServiceState", 0) & 2 for value in accelerators),
+            "Premature accelerator publication; stop and preserve evidence",
+        )
+        if hidden_ready(pci):
+            break
+        require(
+            time.monotonic() < deadline,
+            "Hidden initialization did not finish; display commit was not attempted",
+        )
         time.sleep(1)
-    assert objects(pci,'IONDRVFramebuffer'),'Firmware display disappeared before commit'
-    action('PrepareDisplay')
-    pci=registry()
-    assert hidden_ready(pci),'Accelerator must remain unpublished after preparation'
-    link=objects(pci,'ReimsADLDesktopLink')
-    assert len(link)==1 and link[0].get('RCSADLPWorkaroundLive') is True
-    assert link[0].get('RCSResetPSMIRegistered') is True,'Native reset restore table was not prepared'
-    assert objects(pci,'IONDRVFramebuffer') and not objects(pci,'ReimsIntelADLFramebuffer')
-    print('Prepared but NOT published. Existing desktop remains on firmware framebuffer.')
-elif args.phase=='commit':
-    assert hidden_ready(pci),'Hidden preparation is required before display commit'
-    link=objects(pci,'ReimsADLDesktopLink')
-    assert len(link)==1 and link[0].get('RCSADLPWorkaroundLive') is True
-    assert link[0].get('RCSResetPSMIRegistered') is True,'Native reset restore table was not prepared'
-    assert objects(pci,'IONDRVFramebuffer'),'Unexpected existing display route'
-    action('CommitDisplay',15)
-    deadline=time.monotonic()+10
+
+    require(
+        objects(pci, "IONDRVFramebuffer"),
+        "Firmware display disappeared before commit",
+    )
+    action("PrepareDisplay")
+    pci = registry()
+    require(
+        runtime_state(pci) == "prepared",
+        "Display/reset preparation did not reach the prepared state",
+    )
+    print(
+        "Prepared safely; firmware framebuffer remained active until the verified commit boundary.",
+        flush=True,
+    )
+    return pci
+
+
+def commit_display(pci):
+    require(
+        runtime_state(pci) == "prepared",
+        "Hidden preparation is required before display commit",
+    )
+    action("CommitDisplay", 15)
+    deadline = time.monotonic() + 10
     while True:
-        pci=registry();a=objects(pci,'IntelAccelerator')
-        if len(a)==1 and a[0]['IOServiceState']&2:break
-        assert time.monotonic()<deadline,'Commit returned but accelerator publication not observed'
-        time.sleep(.5)
-    assert len(objects(pci,'ReimsIntelADLFramebuffer'))==1
-    print('Display route published. This is not a pass: verify login, WindowServer stability, and real completed GPU flips.')
-if args.phase in ('commit','video'):
+        pci = registry()
+        accelerators = objects(pci, "IntelAccelerator")
+        if len(accelerators) == 1 and accelerators[0].get("IOServiceState", 0) & 2:
+            break
+        require(
+            time.monotonic() < deadline,
+            "Commit returned but accelerator publication was not observed",
+        )
+        time.sleep(0.5)
+    require(
+        runtime_state(pci) == "published",
+        "Display publication did not reach the supported state",
+    )
+    print(
+        "Display route published; continuing with the required video runtime.",
+        flush=True,
+    )
+    return pci
+
+
+def activate(pci, logdir):
+    processed = []
+    state = runtime_state(pci)
+    print(f"Detected runtime state: {state}", flush=True)
+    if state == "cold":
+        pci = prepare_runtime(pci)
+        processed.append("prepare")
+        state = runtime_state(pci)
+    if state == "prepared":
+        pci = commit_display(pci)
+        processed.append("commit")
+    require(runtime_state(pci) == "published", "Display runtime is not published")
     try:
-        pci=ensure_video(run,registry,objects,logdir)
+        pci = ensure_video(run, registry, objects, logdir)
     except Exception:
-        (logdir/'video-failed.plist').write_bytes(plistlib.dumps(registry()))
-        print('Display activation is not repeated or rolled back here. Video runtime is NOT ready; inspect/complete macOS approval, then use session.py video.',flush=True)
+        try:
+            (logdir / "video-failed.plist").write_bytes(plistlib.dumps(registry()))
+        except Exception:
+            pass
+        print(
+            "Display activation is not repeated or rolled back. Resolve the recorded video approval/error, then rerun only igpu-start.",
+            flush=True,
+        )
         raise
-(logdir/'after.plist').write_bytes(plistlib.dumps(pci))
-print('Evidence:',logdir)
+    processed.append("video-verify")
+    return pci, processed
+
+
+@contextlib.contextmanager
+def exclusive_start():
+    descriptor = os.open(LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError("Another igpu-start process is already running") from error
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def save_failure(logdir, stage, error):
+    failure = {
+        "failed_at": datetime.datetime.now().astimezone().isoformat(),
+        "stage": stage,
+        "error_type": type(error).__name__,
+        "error": str(error),
+    }
+    (logdir / "failure.json").write_text(json.dumps(failure, indent=2) + "\n")
+    try:
+        (logdir / "failed.plist").write_bytes(plistlib.dumps(registry()))
+    except Exception:
+        pass
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Start or finish the approved Intel iGPU runtime using one state-aware command."
+    )
+    parser.parse_args()
+    require(os.geteuid() == 0, "Run the single startup command as administrator")
+    with exclusive_start():
+        logdir = BASE / (
+            "session-"
+            + datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            + "-start"
+        )
+        logdir.mkdir()
+        try:
+            pci = preflight()
+        except Exception as error:
+            save_failure(logdir, "preflight", error)
+            print(
+                f"Preflight stopped before display mutation. Evidence: {logdir}",
+                flush=True,
+            )
+            raise
+        (logdir / "before.plist").write_bytes(plistlib.dumps(pci))
+        initial_state = runtime_state(pci)
+        try:
+            pci, processed = activate(pci, logdir)
+        except Exception as error:
+            save_failure(logdir, "activation", error)
+            print(f"Startup stopped safely. Evidence: {logdir}", flush=True)
+            raise
+        (logdir / "after.plist").write_bytes(plistlib.dumps(pci))
+        result = {
+            "completed_at": datetime.datetime.now().astimezone().isoformat(),
+            "initial_state": initial_state,
+            "final_state": runtime_state(pci),
+            "phases_processed": processed,
+            "video_runtime_verified": True,
+            "windowserver_and_flip_acceptance_required": True,
+        }
+        (logdir / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+        print("Kernel display and video runtime are ready.", flush=True)
+        print(
+            "Still verify the active WindowServer, visible desktop, and increasing completed flips.",
+            flush=True,
+        )
+        print("Evidence:", logdir, flush=True)
+
+
+if __name__ == "__main__":
+    main()
