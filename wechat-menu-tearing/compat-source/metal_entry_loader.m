@@ -72,6 +72,16 @@ BOOL ReimsInstallMetalEntryCandidate(const char *path){
    if(!dlopen(timing.fileSystemRepresentation,RTLD_NOW|RTLD_LOCAL))os_log_error(OS_LOG_DEFAULT,"ReimsWSTiming load failed");
   });
  }
+ if(!strcmp(getprogname(),"FollowUpUI")){
+  static BOOL ready;
+  @synchronized(self){if(!ready){
+   NSString *lib=[[[b executablePath] stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"libReimsMapResolve.dylib"];
+   void *handle=dlopen(lib.fileSystemRepresentation,RTLD_NOW|RTLD_LOCAL);
+   BOOL(*install)(void)=handle?dlsym(handle,"ReimsInstallMapResolveCompat"):NULL;
+   if(!install||!install()){os_log_error(OS_LOG_DEFAULT,"ReimsMapResolve preflight failed");return nil;}
+   ready=YES;
+  }}
+ }
  return [(id)installedDevice allocWithZone:zone];
 }
 @end

@@ -94,7 +94,7 @@ macOS 若在“隐私与安全性”中要求批准系统软件，完成正常�
 
 先用本地合法取得、版本匹配的 TGL Metal 包建立 `/Library/GPUBundles/ReimsTahoeTGLGraphicsMTLDriver.bundle`。它至少应保留 AppleIntelTGLGraphicsMTLDriver、NativeHEVCVA、libigdmd、资源文件及它们的相对依赖。Info.plist 的包文件名、`CFBundleExecutable=ReimsTahoeMetalDevice`、`NSPrincipalClass=ReimsTahoeMetalDevice` 必须与 `manual-gate/profiles.plist` 中的 `MetalPluginName=ReimsTahoeTGLGraphicsMTLDriver` 和 `MetalPluginClassName=ReimsTahoeMetalDevice` 对应。
 
-将公开源码构建出的两个文件放入该包：
+将公开源码构建出的三个文件放入该包：
 
 ```sh
 sudo install -m 755 build/ReimsTahoeMetalDevice \
@@ -102,6 +102,8 @@ sudo install -m 755 build/ReimsTahoeMetalDevice \
 sudo install -m 755 \
   hevc-encode-implementation/backend/error-recovery-20260918/build/libReimsHEVCService.dylib \
   /Library/GPUBundles/ReimsTahoeTGLGraphicsMTLDriver.bundle/Contents/MacOS/libReimsHEVCService.dylib
+sudo install -m 755 build/libReimsMapResolve.dylib \
+  /Library/GPUBundles/ReimsTahoeTGLGraphicsMTLDriver.bundle/Contents/MacOS/libReimsMapResolve.dylib
 sudo codesign --force --deep --sign - \
   /Library/GPUBundles/ReimsTahoeTGLGraphicsMTLDriver.bundle
 sudo codesign --verify --deep --strict \
@@ -109,6 +111,8 @@ sudo codesign --verify --deep --strict \
 ```
 
 应在图形会话启动前完成此步骤。HEVC 服务库由 Metal factory 仅在 `VTEncoderXPCService` 中加载；不需要给剪映或测试客户端注入动态库。
+
+地图合成库仅由 `FollowUpUI` 的 factory 加载。更新已有安装时，备份完整 Metal 包，在副本中放置匹配的新 factory 和地图库、重新签名校验后统一替换。旧账户弹窗进程退出后，重新触发的弹窗才会加载新版本；无需为此重新接管桌面。详见[地图黑框修复与验证](../mapkit-resolve-compat/README.md)。
 
 ## 6. 首次重启后的检查
 
