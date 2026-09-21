@@ -121,28 +121,19 @@ ioreg -r -n GFX0 -l | egrep 'device-id|revision-id'
 ioreg -r -c IntelAccelerator -l
 ```
 
-预期 GFX0 属性仍为 `ffff` 启动身份；延迟发布的 TGL 运行时和 ManualActivation 身份与本地收据一致；此时还没有已发布的 IntelAccelerator。若版本不符或已经存在加速器，不要运行 prepare。
+预期 GFX0 属性仍为 `ffff` 启动身份；延迟发布的 TGL 运行时和 ManualActivation 身份与本地收据一致；首次接管前还没有已发布的 IntelAccelerator。若版本不符，不要启动；若已存在加速器，单入口会核验其状态并跳过已完成阶段。
 
 ## 7. 手动启动
 
-从仓库根目录依次执行：
+只执行仓库根目录的唯一入口：
 
 ```sh
-sudo /usr/bin/python3 desktop-manual-20260917/fix/session.py prepare
-sudo /usr/bin/python3 desktop-manual-20260917/fix/session.py commit
+sudo ./igpu-start
 ```
 
-`prepare` 做物理身份自检、隐藏初始化、RCS/复位准备和显示准备，但保持原有 firmware framebuffer 与桌面。只有输出 `Prepared but NOT published`，且没有提前发布 IntelAccelerator，才进入 `commit`。
+入口先做物理身份和全部本地构建收据预检，再依据 IORegistry 状态自动完成隐藏初始化、RCS/复位准备、显示提交及 VideoDiscovery 中尚未完成的阶段。若显示已经发布而视频阶段因系统批准失败，只处理审批问题并重跑同一命令；状态机不会重新准备或提交显示。脚本不会自动终止 WindowServer；如旧登录会话仍持有旧显示对象，先保存状态，再注销并重新登录一次。不要把脚本返回 0 当作最终性能验收。
 
-`commit` 执行显示交接、发布 IntelAccelerator，并加载或验证 VideoDiscovery。若显示已经发布而视频阶段因系统批准失败，只处理批准问题，然后运行：
-
-```sh
-sudo /usr/bin/python3 desktop-manual-20260917/fix/session.py video
-```
-
-不要重新执行 prepare/commit。脚本不会自动终止 WindowServer；如旧登录会话仍持有旧显示对象，先保存状态，再注销并重新登录一次。不要把脚本返回 0 当作最终性能验收。
-
-每次重新启动后仍保持手动接管，重新执行 prepare 和 commit；项目没有安装开机自动接管任务。
+每次重新启动后仍保持手动接管，重新执行同一 `igpu-start`；项目没有安装开机自动接管任务。
 
 ## 8. 就绪验证
 
@@ -162,6 +153,6 @@ system_profiler SPDisplaysDataType
 
 ## 9. 失败与恢复
 
-prepare 失败时不要 commit；原 firmware 桌面应仍可使用。commit 后视频失败时只运行 video 补齐。发生显示冻结、GPU reset 或 WindowServer watchdog 时先保存现场，不要循环重复接管。
+准备阶段失败时不会提交显示，原 firmware 桌面应仍可使用。显示已发布后视频失败时，处理审批或具体错误并重跑同一入口；状态机会只补齐视频。发生显示冻结、GPU reset 或 WindowServer watchdog 时先保存现场，不要循环重复接管。
 
 恢复时还原部署前保存的 `/Library/Extensions`、Metal bundle 和 EFI 配置，运行正常的 `kmutil install --update-all`，再重启使已加载的内核组件退出。EFI 中的恢复副本必须在修改前准备好；本仓库不会替使用者猜测其磁盘标识或覆盖完整 OpenCore 配置。

@@ -13,13 +13,13 @@ ReimsVideoDiscovery 是本项目核显运行时应加载的视频发布组件。
 
 ## 视频发布如何加载
 
-实际部署须先完成 [同硬件部署与启动](DEPLOY-SAME-HARDWARE.md) 中的外部组件、构建收据、签名、启动隔离和系统审批要求。`desktop-manual-20260917/fix/session.py` 提供 `prepare`、`commit`、`video` 阶段。`commit` 在显示发布后自动调用 `ensure_video`；`video` 用于已经接管的桌面单独补齐视频发布，不重复提交显示。
+实际部署须先完成 [同硬件部署与启动](DEPLOY-SAME-HARDWARE.md) 中的外部组件、构建收据、签名、启动隔离和系统审批要求。启动只使用根目录 `igpu-start`；内部状态机会自动识别冷启动、已准备、已发布或仅缺视频，不对外暴露分阶段命令。
 
 ```sh
-sudo python3 desktop-manual-20260917/fix/session.py video
+sudo ./igpu-start
 ```
 
-运行器核对 VideoDiscovery 包哈希、签名、版本及已加载 UUID。需要时调用 `kmutil load -p <bundle>`，等待发布完成并确认唯一发布者、PhysicalIdentityVerified、Published 以及全部预期视频属性。macOS 若要求用户批准，完成系统审批后重试 `video`。发现未知运行版本会拒绝替换。
+运行器核对 VideoDiscovery 包哈希、签名、版本及已加载 UUID。需要时调用 `kmutil load -p <bundle>`，等待发布完成并确认唯一发布者、PhysicalIdentityVerified、Published 以及全部预期视频属性。macOS 若要求用户批准，完成系统审批后重跑同一命令；已发布显示不会被重复提交。发现未知运行版本会拒绝替换。
 
 此公开版本从 VideoDiscovery 的 `build/ReimsVideoDiscovery.kext` 读取包，并从同目录构建生成的 `video-discovery-current.json` 读取固定身份。`prepare-deferred-runtime.py` 只接受用户本地提供且匹配预期哈希的原始兼容包。
 

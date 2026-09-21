@@ -4,6 +4,7 @@ Historical directory names are preserved because the Metal entry source includes
 
 | Directory | Purpose |
 | --- | --- |
+| igpu-start | Single state-aware manual runtime entrypoint |
 | desktop-reset-recovery-20260917/source | Current DesktopLink, backlight, ABI checks |
 | desktop-reset-recovery-20260917/collector-v5 | Incident recorder and synthetic tests |
 | desktop-manual-20260917/fix | Explicit activation controller and runtime checks |
