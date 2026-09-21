@@ -13,6 +13,7 @@ import subprocess
 import time
 
 from runtime_video import ensure_video, verify_bundle
+from desktop_handoff import ensure_desktop
 
 BASE = pathlib.Path(__file__).resolve().parent
 ROOT = BASE.parents[1]
@@ -329,6 +330,17 @@ def main():
             + "-start"
         )
         logdir.mkdir()
+        print(f'Startup evidence: {logdir}', flush=True)
+        print('If desktop handoff is needed, this will end the current desktop session. Save work first.', flush=True)
+        child = os.fork()
+        if child:
+            _, status = os.waitpid(child, 0)
+            os._exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1)
+        os.setsid()
+        with open(os.devnull, 'rb') as source, (logdir / 'startup.log').open('a', buffering=1) as output:
+            os.dup2(source.fileno(), 0)
+            os.dup2(output.fileno(), 1)
+            os.dup2(output.fileno(), 2)
         try:
             pci = preflight()
         except Exception as error:
@@ -342,6 +354,9 @@ def main():
         initial_state = runtime_state(pci)
         try:
             pci, processed = activate(pci, logdir)
+            desktop = ensure_desktop(run, registry, objects, logdir)
+            processed.append('desktop-handoff-verified')
+            pci = registry()
         except Exception as error:
             save_failure(logdir, "activation", error)
             print(f"Startup stopped safely. Evidence: {logdir}", flush=True)
@@ -353,12 +368,14 @@ def main():
             "final_state": runtime_state(pci),
             "phases_processed": processed,
             "video_runtime_verified": True,
-            "windowserver_and_flip_acceptance_required": True,
+            "windowserver_and_flip_acceptance_required": False,
+            "desktop": desktop,
+            "visible_desktop_user_confirmation_required": True,
         }
         (logdir / "result.json").write_text(json.dumps(result, indent=2) + "\n")
-        print("Kernel display and video runtime are ready.", flush=True)
+        print("Kernel display, video runtime and completed desktop flips verified.", flush=True)
         print(
-            "Still verify the active WindowServer, visible desktop, and increasing completed flips.",
+            "Visible desktop still requires user confirmation.",
             flush=True,
         )
         print("Evidence:", logdir, flush=True)
