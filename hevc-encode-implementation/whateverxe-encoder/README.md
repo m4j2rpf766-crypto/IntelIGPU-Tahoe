@@ -29,9 +29,15 @@ build/check_provider expect-unavailable
 
 前两步构建并签名用户态程序。最后一步检查缺少原生后端时的返回值，并通过 `VTCopyVideoEncoderList` 确认此编码器未列入可用设备。测试在独立进程中调用注册函数。
 
+现有 HEVC 样片可以用于验证压缩帧传输。运行 `python3 roundtrip/run_roundtrip.py --video /path/to/main.mp4`，程序会逐帧比较码流、参数集、时间戳和关键帧标记。本机 60 帧样片中的 1,505,033 字节编码数据全部一致。
+
 要接入可工作的原生后端，通过 `build_worker.py --native-adapter` 编译其实现，并用 `--expect available` 运行探测。后端需要识别当前启动的 Intel 设备，建立属于当前会话的编码上下文，把输入交给 Gen12 视频引擎，等待硬件完成，并返回带时间戳和参数集的 HEVC 压缩帧。worker 使用本次启动的设备编号核对身份。图像转换支持 BGRA 输入，worker 按 NV12 接收视频数据。
 
 带有真实后端时，可用 `check_provider auto input.bgra output.h265 60 bgra` 验证普通的硬件必选会话，用 `check_provider intel input.bgra output.h265 60 bgra` 验证指定 Intel GPU 的会话。输入为紧密排列的 1920 × 1080 BGRA。验收还需独立解码输出、核对帧数与时间戳、确认画面与输入相符，并在正常的驱动发现路径下重跑原版 FFmpeg。
+
+在同时安装 Intel 与 NVIDIA 驱动的测试机上，隔离的工厂测试中，默认选择曾返回 NVIDIA 编码器。当前系统的动态注册接口能列出此 Intel 前端的编码器 ID，但在该测试中未列出其 GPU 注册表编号。显式指定 Intel GPU 的会话返回 `-12908`。自动选择和指定设备两种情况均需在接入真实后端后继续验证，测试客户端会记录实际选择的编码器 ID。
+
+`package_driver.py` 在单独的构建目录生成 Metal 驱动包。其离线检查会加载包、验证入口类继承自本机的 `MTLIGAccelDevice`，并核对初始化方法的 ABI。可选的 `discovery` 内核扩展选择这个包。两者都已在测试机完成编译和签名校验；通过系统加载内核扩展、创建实际 Metal 设备以及原版应用自动发现仍待验证。
 
 ## 原生驱动还需实现的部分
 
