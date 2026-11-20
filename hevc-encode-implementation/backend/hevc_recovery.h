@@ -17,6 +17,12 @@ int reims_context_error(void *);
  * only after all references and a recovery slot have been acquired. */
 int reims_execute_owned_batch(void *,void *,unsigned,unsigned,unsigned *,unsigned *,
                               ReimsScratch *,unsigned,const uint32_t *,size_t);
+typedef int (*ReimsOwnedBatchPrepare)(void *);
+/* The callback runs only after the context is reserved and all referenced
+ * resources are retained, immediately before the native submit call. */
+int reims_execute_owned_batch_with_prepare(void *,void *,unsigned,unsigned,
+                              unsigned *,unsigned *,ReimsScratch *,unsigned,
+                              const uint32_t *,size_t,ReimsOwnedBatchPrepare,void *);
 #ifdef __cplusplus
 }
 #endif

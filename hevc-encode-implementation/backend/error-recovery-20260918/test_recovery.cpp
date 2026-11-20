@@ -1,4 +1,5 @@
 #include "../hevc_recovery.h"
+#include "../live_submit_contract.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurface.h>
 #include <mach/mach_vm.h>
@@ -15,6 +16,23 @@
 #include <set>
 extern "C" void *reims_submit_hook(void);
 extern "C" void reims_configure_production(const char *);
+extern "C" int reims_submit_gen12_probe(void *,const void *,size_t,const void *,size_t,
+                                         const char *,void *,unsigned,unsigned *,unsigned *);
+extern "C" int reims_prepare_owned_gen12_probe(void *,const void *,size_t,const void *,size_t,
+                                                const char *,void *,unsigned *);
+
+static bool inspect_submit_pages=false;
+static bool submit_saw_transformed_pages=false;
+static const uint32_t *submit_commands=nullptr,*submit_sideband=nullptr;
+static std::vector<uint32_t> submit_original_commands,submit_original_sideband;
+static size_t submit_command_dwords=0,submit_sideband_dwords=0;
+struct CpuPages {
+ uint32_t commands[4]={1,2,3,4},sideband[4]={5,6,7,8};unsigned callback_calls=0;
+};
+static int mutateCpuPages(void *opaque){
+ auto *pages=(CpuPages *)opaque;pages->callback_calls++;
+ pages->commands[0]=0xfeed0001;pages->sideband[0]=0xfeed0002;return 1;
+}
 
 // All IOAccel entry points below are test doubles. No IOService/user client or
 // GPU submission is opened. CF objects, VM mappings and IOSurfaces are real.
@@ -40,7 +58,27 @@ extern "C" void IOAccelResourceRelease(void *r){if(r)CFRelease(r);}
 extern "C" unsigned IOAccelVideoContextGetDataBufferClassCount(void *){return 0;}
 extern "C" void *IOAccelVideoContextGetDataBufferResource(void *,unsigned){return nullptr;}
 extern "C" void IOAccelVideoContextRelease(void *io){state(io)->releases++;CFRelease(io);}
-extern "C" int IOAccelVideoContextSubmitDataBuffers(void *io,unsigned,unsigned *out,unsigned *err){auto *s=state(io);s->submits++;*out=99;*err=s->device;return s->submit;}
+extern "C" int IOAccelVideoContextSubmitDataBuffers(void *io,unsigned,unsigned *out,unsigned *err){
+ auto *s=state(io);s->submits++;
+ if(inspect_submit_pages){
+  assert(submit_commands&&submit_sideband&&submit_command_dwords&&submit_sideband_dwords);
+  std::vector<uint32_t> live_commands(submit_commands,submit_commands+submit_command_dwords);
+  std::vector<uint32_t> live_sideband(submit_sideband,submit_sideband+submit_sideband_dwords);
+  uint32_t used=0;unsigned used_tokens=0;
+  for(size_t i=4;i<live_sideband.size();){
+   if(live_sideband[i]==0x200)break;
+   size_t n=live_sideband[i]>>16;assert(n>=2&&n<=live_sideband.size()-i);
+   if(live_sideband[i]==0x38000){assert(n==3);used=live_sideband[i+1];used_tokens++;}
+   i+=n;
+  }
+  submit_saw_transformed_pages=used_tokens==1&&
+      live_commands!=submit_original_commands&&live_sideband!=submit_original_sideband&&
+      reims::video_batch_used_boundary_matches(live_commands.data(),live_commands.size(),
+          used,live_sideband.data(),live_sideband.size());
+  assert(submit_saw_transformed_pages);
+ }
+ *out=99;*err=s->device;return s->submit;
+}
 extern "C" int IOAccelVideoContextFinishFenceEvent(void *io,unsigned){auto *s=state(io);s->fences++;if(s->blockFence){std::unique_lock<std::mutex> l(s->mutex);s->cv.wait(l,[s]{return s->allow;});}return s->fence;}
 extern "C" int IOAccelVideoContextFinish(void *io){
  auto *s=state(io);s->drains++;std::unique_lock<std::mutex> l(s->mutex);
@@ -67,15 +105,55 @@ static std::vector<uint32_t> side(std::initializer_list<unsigned> handles){
 static ReimsScratch scratch(void *shared){ReimsScratch s={};assert(reims_scratch_create(shared,4096,&s));return s;}
 static void drop(Native r){reims_owned_resource_release(r.resource);assert(reims_owned_vm_deallocate(mach_task_self(),r.address,r.bytes)==0);}
 static int execute(void *shared,void *io,ReimsScratch &s,const std::vector<uint32_t> &b,unsigned &err){unsigned out=0;return reims_execute_owned_batch(shared,io,0,1,&out,&err,&s,1,b.data(),b.size());}
+static int executeWithPrepare(void *shared,void *io,ReimsScratch &s,
+                              const std::vector<uint32_t> &b,unsigned &err,CpuPages &pages){
+ unsigned out=0;return reims_execute_owned_batch_with_prepare(shared,io,0,1,&out,&err,
+     &s,1,b.data(),b.size(),mutateCpuPages,&pages);
+}
 
 static std::vector<uint32_t> fixture(const char *p){std::ifstream f(p,std::ios::binary|std::ios::ate);assert(f);auto n=f.tellg();assert(n>0&&n%4==0);std::vector<uint32_t> b(n/4);f.seekg(0);f.read((char *)b.data(),n);assert(f);return b;}
 int main(int argc,char **argv){
- assert(argc==1||argc==3);
+ assert(argc==1||(argc>1&&(argc-1)%2==0));
  void *shared=(void *)0x1234;
+ // Exercise the exact context-owned range validator. A copied command buffer
+ // or a copied sideband is rejected even when the other half still matches.
+ {
+  State st;void *io=context(st);uint32_t commands[8]={0},sideband[9]={};
+  commands[3]=0x05000000;sideband[4]=0x38000;sideband[5]=4;sideband[6]=9;
+  sideband[7]=0x200;sideband[8]=1;
+  uint64_t words[32]={};words[0]=(uintptr_t)shared;words[1]=(uintptr_t)io;
+  words[2]=(uintptr_t)commands;words[4]=words[2]+sizeof(commands);
+  words[16]=(uintptr_t)sideband;words[12]=words[16]+sizeof(sideband);
+  assert(reims::video_buffers_match_context(words,32,shared,io,commands,sizeof(commands),
+                                             sideband,sizeof(sideband)));
+  assert(reims::video_batch_used_boundary_matches(commands,8,4,sideband,9));
+  std::vector<uint32_t> copiedCommands(commands,commands+8),copiedSideband(sideband,sideband+9);
+  assert(!reims::video_buffers_match_context(words,32,shared,io,copiedCommands.data(),
+      sizeof(commands),sideband,sizeof(sideband)));
+  assert(!reims::video_buffers_match_context(words,32,shared,io,commands,
+      sizeof(commands),copiedSideband.data(),sizeof(sideband)));
+  assert(!reims::video_batch_used_boundary_matches(commands,8,3,sideband,9));
+
+  for(unsigned mismatch=0;mismatch<2;mismatch++){
+   unsigned error=0;auto *out=(unsigned *)((char *)words+0x54);
+   *out=77;error=0;
+   const void *passedCommands=mismatch?commands:copiedCommands.data();
+   const void *passedSideband=mismatch?copiedSideband.data():sideband;
+   assert(reims_submit_gen12_probe(shared,passedCommands,sizeof(commands),passedSideband,
+       sizeof(sideband),nullptr,io,0,out,&error)==0);
+   assert(*out==0&&error==0xe00002c7u&&st.submits==0);
+   assert(reims_prepare_owned_gen12_probe(shared,passedCommands,sizeof(commands),
+       passedSideband,sizeof(sideband),nullptr,io,out)==0&&st.submits==0);
+  }
+  copiedSideband[5]=3;
+  assert(!reims::video_batch_used_boundary_matches(commands,8,4,copiedSideband.data(),9));
+  reims_owned_context_release(io);
+ }
  // Replay a captured native batch through the actual production submit hook
  // and converter. Only the final IOAccel calls are replaced with test doubles.
- for(unsigned failure=0;argc==3&&failure<2;failure++){
-  auto commands=fixture(argv[1]),sb=fixture(argv[2]);std::set<unsigned> handles;
+ const unsigned fixturePairs=(unsigned)(argc-1)/2;
+ for(unsigned pair=0;pair<fixturePairs;pair++)for(unsigned failure=0;failure<2;failure++){
+  auto commands=fixture(argv[1+pair*2]),sb=fixture(argv[2+pair*2]);std::set<unsigned> handles;
   for(size_t t=4;t<sb.size();){unsigned n=sb[t]>>16;if(sb[t]==0x200)break;assert(n>=2&&n<=sb.size()-t);
    if((sb[t]&65535)==0x8200)for(size_t r=t+3;r<t+n&&sb[r];r+=5){unsigned op=(sb[r]>>1)&7;handles.insert(sb[r+1]&65535);if(op==2||op==4||op==5||op==6)handles.insert(sb[r+1]>>16);}
    t+=n;
@@ -84,10 +162,18 @@ int main(int argc,char **argv){
   State st;st.submit=failure?int(0xe00002bdu):0;void *io=context(st);uint64_t w[32]={};
   w[0]=(uintptr_t)shared;w[1]=(uintptr_t)io;w[2]=(uintptr_t)commands.data();w[4]=w[2]+commands.size()*4;w[16]=(uintptr_t)sb.data();w[12]=w[16]+sb.size()*4;
   reims_configure_production("test-only");unsigned err=0;auto hook=(int(*)(void*,unsigned,unsigned*,unsigned*))reims_submit_hook();
+  const auto originalCommands=commands,originalSideband=sb;
+  auto *contextOut=(unsigned *)((char *)w+0x54);
+  assert(reims_prepare_owned_gen12_probe(shared,commands.data(),commands.size()*4,
+      sb.data(),sb.size()*4,nullptr,io,contextOut)==1);
+  assert(st.submits==0&&commands==originalCommands&&sb==originalSideband);
+  submit_commands=commands.data();submit_sideband=sb.data();submit_command_dwords=commands.size();submit_sideband_dwords=sb.size();
+  submit_original_commands=commands;submit_original_sideband=sb;submit_saw_transformed_pages=false;inspect_submit_pages=true;
   int result=hook(io,0,(unsigned *)((char *)w+0x54),&err);assert(st.submits==1);assert(result==st.submit&&err==(unsigned)st.submit);
+  inspect_submit_pages=false;assert(submit_saw_transformed_pages);
   for(auto r:native)drop(r);reims_owned_context_release(io);if(failure)allow(st);until([&]{return activities==0;});
  }
- if(argc==3)puts("PASS: optional captured native HEVC batch replay");
+ if(fixturePairs)puts("PASS: captured native HEVC batch replay; submit double observed transformed context-owned pages");
  else puts("SKIP: private native command fixture not distributed; synthetic production flush and ownership tests remain enabled");
  // The producer's final flush also owns its native fence resource on error.
  {
@@ -101,6 +187,32 @@ int main(int argc,char **argv){
  {
   State st;void *io=context(st);Native r=resource(shared);auto sc=scratch(shared);uintptr_t sa=sc.backing;auto b=side({handle(r.resource),sc.handle});unsigned err=0;
   assert(execute(shared,io,sc,b,err)==2);assert(st.submits==1&&st.fences==1&&st.drains==0);assert(!sc.resource&&!mapped(sa));assert(CFGetRetainCount(r.resource)==1);drop(r);reims_owned_context_release(io);assert(st.releases==2&&activities==0);
+ }
+ // The command-page commit callback runs only after the context and all
+ // referenced resources are reserved. Unknown handles and busy contexts
+ // reject before the callback can change either producer page.
+ {
+  State st;void *io=context(st);auto sc=scratch(shared);auto b=side({0x7654,sc.handle});
+  CpuPages pages;const CpuPages original=pages;unsigned err=0;
+  assert(executeWithPrepare(shared,io,sc,b,err,pages)==0);
+  assert(pages.callback_calls==0&&
+      !memcmp(pages.commands,original.commands,sizeof(pages.commands))&&
+      !memcmp(pages.sideband,original.sideband,sizeof(pages.sideband))&&st.submits==0);
+  reims_scratch_destroy(&sc);reims_owned_context_release(io);
+ }
+ {
+  State st;st.blockFence=true;void *io=context(st);auto active=scratch(shared);
+  auto activeSide=side({active.handle});unsigned activeErr=0;int activeResult=0;
+  std::thread running([&]{activeResult=execute(shared,io,active,activeSide,activeErr);});
+  until([&]{return st.fences==1;});
+  auto rejected=scratch(shared);auto rejectedSide=side({rejected.handle});CpuPages pages;unsigned rejectedErr=0;
+  const CpuPages original=pages;unsigned submissions=st.submits;
+  assert(executeWithPrepare(shared,io,rejected,rejectedSide,rejectedErr,pages)==-1);
+  assert(pages.callback_calls==0&&
+      !memcmp(pages.commands,original.commands,sizeof(pages.commands))&&
+      !memcmp(pages.sideband,original.sideband,sizeof(pages.sideband))&&st.submits==submissions);
+  reims_scratch_destroy(&rejected);allow(st);running.join();assert(activeResult==2);
+  reims_owned_context_release(io);assert(activities==0);
  }
  // Both submit return errors and device error words are preserved. Recovery
  // may block without stopping this thread or another context's successful job.

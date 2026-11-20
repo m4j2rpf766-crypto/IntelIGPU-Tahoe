@@ -204,13 +204,19 @@ extern "C" void reims_owned_context_release(void *io){
  if(extra)IOAccelVideoContextRelease(extra);
  if(activity)xpc_transaction_end();
 }
-extern "C" int reims_execute_owned_batch(void *shared,void *io,unsigned flags,unsigned event,
- unsigned *out,unsigned *error,ReimsScratch *scratch,unsigned count,const uint32_t *side,size_t words){
+extern "C" int reims_execute_owned_batch_with_prepare(void *shared,void *io,unsigned flags,unsigned event,
+ unsigned *out,unsigned *error,ReimsScratch *scratch,unsigned count,const uint32_t *side,size_t words,
+ ReimsOwnedBatchPrepare prepare,void *prepareContext){
  if(!shared||!io||!out||!error||(count&&!scratch)||count>11||!side||words<6)return 0;
  Context *c=nullptr;bool acquired=false;
  {
   Lock lock;c=find(io);
-  if(c&&(c->failed||c->busy)){*out=0;*error=(unsigned)(c->failed?c->error:kBusy);return -1;}
+  if(c&&(c->failed||c->busy)){
+   // The active submit uses this context's native output slot. Do not clobber
+   // it while rejecting a concurrent caller.
+   if(!c->busy){*out=0;*error=(unsigned)c->error;}
+   return -1;
+  }
   if(!c){for(auto &slot:contexts)if(!slot.io){c=&slot;c->io=(void *)CFRetain(io);break;}}
   if(!c){*out=0;*error=(unsigned)kBusy;return -1;}
   c->busy=true;
@@ -258,10 +264,21 @@ extern "C" int reims_execute_owned_batch(void *shared,void *io,unsigned flags,un
   if(count)memset(scratch,0,count*sizeof(*scratch));
   xpc_transaction_begin();c->activity=true;
  }
+ if(prepare&&!prepare(prepareContext)){
+  void *release=nullptr;
+  {
+   Lock lock;
+   releaseHolds(*c);c->busy=false;c->activity=false;
+   if(c->released){release=c->io;*c={};}
+  }
+  if(release)IOAccelVideoContextRelease(release);
+  xpc_transaction_end();return 0;
+ }
  int result=IOAccelVideoContextSubmitDataBuffers(io,flags,out,error);
- int finish=(!result&&!*error)?IOAccelVideoContextFinishFenceEvent(io,event):kFailure;
- fprintf(stderr,"HEVC_RECOVERY submit=%x device=%x finish=%x event=%u\n",result,*error,finish,event);
- if(!result&&!*error&&!finish){
+ const unsigned deviceError=*error;
+ int finish=(!result&&!deviceError)?IOAccelVideoContextFinishFenceEvent(io,event):kFailure;
+ fprintf(stderr,"HEVC_RECOVERY submit=%x device=%x finish=%x event=%u\n",result,deviceError,finish,event);
+ if(!result&&!deviceError&&!finish){
   void *release=nullptr;
   {Lock lock;releaseHolds(*c);c->busy=false;c->activity=false;if(c->released){release=c->io;*c={};}}
   if(release)IOAccelVideoContextRelease(release);
@@ -269,7 +286,7 @@ extern "C" int reims_execute_owned_batch(void *shared,void *io,unsigned flags,un
  }
  {
   Lock lock;c->busy=false;c->failed=true;
-  c->error=result?result:(*error?int(*error):finish);if(!c->error)c->error=kFailure;
+  c->error=result?result:(deviceError?int(deviceError):finish);if(!c->error)c->error=kFailure;
   *out=0;*error=(unsigned)c->error;c->recovering=true;
   fprintf(stderr,"HEVC_RECOVERY failed error=%x resources=%u scratch=%u; native error returned\n",c->error,c->heldCount,c->scratchCount);
  }
@@ -277,4 +294,10 @@ extern "C" int reims_execute_owned_batch(void *shared,void *io,unsigned flags,un
  if(pthread_create(&thread,nullptr,recover,c)==0)pthread_detach(thread);
  else {Lock lock;c->recovering=false;fprintf(stderr,"HEVC_RECOVERY worker_unavailable retained\n");}
  return -1;
+}
+
+extern "C" int reims_execute_owned_batch(void *shared,void *io,unsigned flags,unsigned event,
+ unsigned *out,unsigned *error,ReimsScratch *scratch,unsigned count,const uint32_t *side,size_t words){
+ return reims_execute_owned_batch_with_prepare(shared,io,flags,event,out,error,
+     scratch,count,side,words,nullptr,nullptr);
 }

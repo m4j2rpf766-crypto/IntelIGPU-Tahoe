@@ -2,6 +2,8 @@
 #include "video_batch_rewrite.h"
 #include "gen12_scratch.h"
 #include "hevc_recovery.h"
+#include "live_submit_contract.h"
+#include <mach/mach_vm.h>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -13,10 +15,188 @@ extern "C" int IOAccelVideoContextFinishFenceEvent(void*,unsigned);
 extern "C" void reims_dump_surfaces(const char*);
 
 namespace {
+constexpr uintptr_t kVideoContextOutputOffset = 0x54;
+
 uint32_t length(uint32_t h){
     if(h>>29==0){uint32_t op=(h>>23)&63;return op==0||op==10?1:(h&63)+2;}
     return (h&0xffff0000)==0x68000000?1:(h&4095)+2;
 }
+
+bool readLiveContext(uintptr_t address, uint64_t words[32]) {
+    if (!address || !words) return false;
+    mach_vm_size_t copied = 0;
+    return mach_vm_read_overwrite(mach_task_self(), address, sizeof(uint64_t) * 32,
+        reinterpret_cast<mach_vm_address_t>(words), &copied) == KERN_SUCCESS &&
+        copied == sizeof(uint64_t) * 32;
+}
+
+bool readLiveBuffer(const void *address, void *destination, size_t bytes) {
+    if (!address || !destination || !bytes) return false;
+    mach_vm_size_t copied = 0;
+    return mach_vm_read_overwrite(mach_task_self(),
+        reinterpret_cast<mach_vm_address_t>(address), bytes,
+        reinterpret_cast<mach_vm_address_t>(destination), &copied) == KERN_SUCCESS &&
+        copied == bytes;
+}
+
+bool writeLiveBuffer(void *address, const void *source, size_t bytes) {
+    if (!address || !source || !bytes || bytes > UINT32_MAX) return false;
+    return mach_vm_write(mach_task_self(), reinterpret_cast<mach_vm_address_t>(address),
+        reinterpret_cast<vm_offset_t>(source), static_cast<mach_msg_type_number_t>(bytes)) ==
+        KERN_SUCCESS;
+}
+
+bool buffersMatchLiveContext(uintptr_t contextAddress, void *shared, void *io,
+                             const void *commands, size_t commandBytes,
+                             const void *sideband, size_t sidebandBytes,
+                             uint64_t contextWords[32]) {
+    return readLiveContext(contextAddress, contextWords) &&
+        reims::video_buffers_match_context(contextWords, 32, shared, io, commands,
+            commandBytes, sideband, sidebandBytes);
+}
+
+bool liveBuffersEqual(uintptr_t contextAddress, void *shared, void *io,
+                      const void *commands, size_t commandBytes,
+                      const void *sideband, size_t sidebandBytes,
+                      const std::vector<uint32_t> &expectedCommands,
+                      const std::vector<uint32_t> &expectedSideband) {
+    uint64_t contextWords[32] = {};
+    if (!buffersMatchLiveContext(contextAddress, shared, io, commands, commandBytes,
+                                 sideband, sidebandBytes, contextWords) ||
+        expectedCommands.size() * sizeof(uint32_t) != commandBytes ||
+        expectedSideband.size() * sizeof(uint32_t) != sidebandBytes) return false;
+
+    std::vector<uint32_t> commandsRead(expectedCommands.size());
+    std::vector<uint32_t> sidebandRead(expectedSideband.size());
+    return readLiveBuffer(commands, commandsRead.data(), commandBytes) &&
+        readLiveBuffer(sideband, sidebandRead.data(), sidebandBytes) &&
+        commandsRead == expectedCommands && sidebandRead == expectedSideband;
+}
+
+bool rollbackLiveBuffers(uintptr_t contextAddress, void *shared, void *io,
+                         void *commands, size_t commandBytes,
+                         void *sideband, size_t sidebandBytes,
+                         const std::vector<uint32_t> &originalCommands,
+                         const std::vector<uint32_t> &originalSideband,
+                         const std::vector<uint32_t> &preparedCommands,
+                         const std::vector<uint32_t> &preparedSideband) {
+    std::vector<uint32_t> currentCommands(originalCommands.size());
+    std::vector<uint32_t> currentSideband(originalSideband.size());
+    uint64_t contextWords[32] = {};
+    if (!buffersMatchLiveContext(contextAddress, shared, io, commands, commandBytes,
+                                 sideband, sidebandBytes, contextWords) ||
+        !readLiveBuffer(commands, currentCommands.data(), commandBytes) ||
+        !readLiveBuffer(sideband, currentSideband.data(), sidebandBytes) ||
+        (currentCommands != originalCommands && currentCommands != preparedCommands) ||
+        (currentSideband != originalSideband && currentSideband != preparedSideband))
+        return false;
+
+    if (currentCommands != originalCommands) {
+        // Re-read both ranges and their owner immediately before each write.
+        if (!liveBuffersEqual(contextAddress, shared, io, commands, commandBytes,
+                              sideband, sidebandBytes, preparedCommands, currentSideband) ||
+            !writeLiveBuffer(commands, originalCommands.data(), commandBytes) ||
+            !liveBuffersEqual(contextAddress, shared, io, commands, commandBytes,
+                              sideband, sidebandBytes, originalCommands, currentSideband))
+            return false;
+        currentCommands = originalCommands;
+    }
+    if (currentSideband != originalSideband) {
+        if (!liveBuffersEqual(contextAddress, shared, io, commands, commandBytes,
+                              sideband, sidebandBytes, currentCommands, preparedSideband) ||
+            !writeLiveBuffer(sideband, originalSideband.data(), sidebandBytes))
+            return false;
+    }
+    return liveBuffersEqual(contextAddress, shared, io, commands, commandBytes,
+                            sideband, sidebandBytes, originalCommands, originalSideband);
+}
+
+bool liveSubmissionReady(uintptr_t contextAddress, void *shared, void *io,
+                         const void *commands, size_t commandBytes,
+                         const void *sideband, size_t sidebandBytes,
+                         const reims::VideoBatch &batch) {
+    return reims::video_batch_used_boundary_matches(batch.commands.data(),
+            batch.commands.size(), batch.used_dwords, batch.sideband.data(),
+            batch.sideband.size()) &&
+        liveBuffersEqual(contextAddress, shared, io, commands, commandBytes,
+                         sideband, sidebandBytes, batch.commands, batch.sideband);
+}
+
+struct LiveBatchCommit {
+    uintptr_t contextAddress;
+    void *shared;
+    void *io;
+    const void *commands;
+    size_t commandBytes;
+    const void *sideband;
+    size_t sidebandBytes;
+    uint32_t originalUsedDwords;
+    const std::vector<uint32_t> *originalCommands;
+    const std::vector<uint32_t> *originalSideband;
+    const reims::VideoBatch *prepared;
+    unsigned event;
+    unsigned scratchCount;
+};
+
+int commitLiveBatch(void *opaque) {
+    auto *commit = static_cast<LiveBatchCommit *>(opaque);
+    if (!commit || !commit->originalCommands || !commit->originalSideband ||
+        !commit->prepared ||
+        !reims::video_batch_used_boundary_matches(commit->originalCommands->data(),
+            commit->originalCommands->size(), commit->originalUsedDwords,
+            commit->originalSideband->data(), commit->originalSideband->size()) ||
+        !liveBuffersEqual(commit->contextAddress, commit->shared, commit->io,
+            commit->commands, commit->commandBytes, commit->sideband,
+            commit->sidebandBytes, *commit->originalCommands,
+            *commit->originalSideband)) {
+        fprintf(stderr,"HEVC_GEN12_REJECT live_buffers_changed\n");
+        return 0;
+    }
+
+    bool writesVerified = writeLiveBuffer(const_cast<void *>(commit->commands),
+        commit->prepared->commands.data(), commit->commandBytes) &&
+        liveBuffersEqual(commit->contextAddress, commit->shared, commit->io,
+            commit->commands, commit->commandBytes, commit->sideband,
+            commit->sidebandBytes, commit->prepared->commands,
+            *commit->originalSideband);
+    if (writesVerified) {
+        writesVerified = writeLiveBuffer(const_cast<void *>(commit->sideband),
+            commit->prepared->sideband.data(), commit->sidebandBytes) &&
+            liveSubmissionReady(commit->contextAddress, commit->shared, commit->io,
+                commit->commands, commit->commandBytes, commit->sideband,
+                commit->sidebandBytes, *commit->prepared);
+    }
+    if (!writesVerified) {
+        const bool restored = rollbackLiveBuffers(commit->contextAddress,
+            commit->shared, commit->io, const_cast<void *>(commit->commands),
+            commit->commandBytes, const_cast<void *>(commit->sideband),
+            commit->sidebandBytes, *commit->originalCommands,
+            *commit->originalSideband, commit->prepared->commands,
+            commit->prepared->sideband);
+        fprintf(stderr,"HEVC_GEN12_REJECT live_write_verify restored=%d\n",restored);
+        return 0;
+    }
+    fprintf(stderr,"HEVC_GEN12_SUBMIT event=%u used_dwords=%u scratch_retained=%u\n",
+            commit->event,commit->prepared->used_dwords,commit->scratchCount);
+    return 1;
+}
+
+bool deriveLiveContext(void *shared, void *io,
+                       const void *commands, size_t commandBytes,
+                       const void *sideband, size_t sidebandBytes,
+                       unsigned *out, uintptr_t &contextAddress,
+                       uint64_t contextWords[32]) {
+    if (!shared || !io || !commands || !sideband || !out ||
+        commandBytes % 4 || sidebandBytes % 4 ||
+        commandBytes > 1048576 || sidebandBytes > 65536 ||
+        reinterpret_cast<uintptr_t>(out) < kVideoContextOutputOffset)
+        return false;
+    contextAddress = reinterpret_cast<uintptr_t>(out) - kVideoContextOutputOffset;
+    return (contextAddress & (alignof(uint64_t) - 1)) == 0 &&
+        buffersMatchLiveContext(contextAddress, shared, io, commands, commandBytes,
+                                sideband, sidebandBytes, contextWords);
+}
+
 void save(const char*dir,const char*name,const std::vector<uint32_t>&v){
     if(!dir)return;
     std::string path=std::string(dir)+"/"+name;
@@ -27,11 +207,12 @@ void save(const char*dir,const char*name,const std::vector<uint32_t>&v){
 // are released before return and MUST NOT be replayed from the saved files.
 // This entry has no video submit symbol and never writes the original batch.
 static int prepare(void*shared,const void*cb,size_t cn,const void*sb,size_t sn,const char*dir,
-                   void*io,unsigned flags,unsigned*out,unsigned*error){
+                   uintptr_t liveContext,void*io,unsigned flags,unsigned*out,unsigned*error){
     if(!shared||!cb||!sb||cn%4||sn%4||cn>1048576||sn>65536)return 0;
     reims::VideoBatch in;
     in.commands.resize(cn/4);in.sideband.resize(sn/4);
     memcpy(in.commands.data(),cb,cn);memcpy(in.sideband.data(),sb,sn);
+    const std::vector<uint32_t> originalSideband = in.sideband;
     for(size_t t=4;t<in.sideband.size();){
         uint32_t n=in.sideband[t]>>16;
         if(in.sideband[t]==0x200)break;
@@ -234,11 +415,11 @@ static int prepare(void*shared,const void*cb,size_t cn,const void*sb,size_t sn,c
         // its caller passes that same slot to FinishFenceEvent (0x21486).
         // The separate submit output is NOT the fence slot.
         if(event_count==1 && out && error && prepared.commands.size()*4==cn && prepared.sideband.size()*4==sn){
-            memcpy(const_cast<void*>(cb),prepared.commands.data(),cn);
-            memcpy(const_cast<void*>(sb),prepared.sideband.data(),sn);
-            fprintf(stderr,"HEVC_GEN12_SUBMIT event=%u used_dwords=%u scratch_retained=%u\n",event,prepared.used_dwords,created);
-            int completed=reims_execute_owned_batch(shared,io,flags,event,out,error,
-                scratch,created,prepared.sideband.data(),prepared.sideband.size());
+            LiveBatchCommit commit{liveContext,shared,io,cb,cn,sb,sn,in.used_dwords,
+                &in.commands,&originalSideband,&prepared,event,created};
+            int completed=reims_execute_owned_batch_with_prepare(shared,io,flags,event,
+                out,error,scratch,created,prepared.sideband.data(),prepared.sideband.size(),
+                commitLiveBatch,&commit);
             if(completed==2&&getenv("REIMS_HEVC_DUMP_SURFACES")){
                 std::vector<uint32_t> patched(cn/4);memcpy(patched.data(),cb,cn);char name[80];snprintf(name,sizeof(name),"post-submit-%u.bin",event);save(dir,name,patched);
             }
@@ -255,9 +436,30 @@ static int prepare(void*shared,const void*cb,size_t cn,const void*sb,size_t sn,c
 }
 
 extern "C" int reims_prepare_gen12_probe(void*s,const void*c,size_t cn,const void*b,size_t bn,const char*d){
-    return prepare(s,c,cn,b,bn,d,nullptr,0,nullptr,nullptr);
+    return prepare(s,c,cn,b,bn,d,0,nullptr,0,nullptr,nullptr);
+}
+// Production diagnostic path: unlike the legacy offline API above, this
+// entry proves that both inputs are still the exact ranges in the supplied
+// IOAccel client context. It intentionally remains no-submit and does not
+// write either producer buffer.
+extern "C" int reims_prepare_owned_gen12_probe(void*s,const void*c,size_t cn,
+        const void*b,size_t bn,const char*d,void*io,unsigned*out){
+    uintptr_t contextAddress=0;uint64_t contextWords[32]={};
+    if(!deriveLiveContext(s,io,c,cn,b,bn,out,contextAddress,contextWords))return 0;
+    return prepare(s,c,cn,b,bn,d,contextAddress,nullptr,0,nullptr,nullptr);
 }
 extern "C" int reims_submit_gen12_probe(void*s,const void*c,size_t cn,const void*b,size_t bn,const char*d,
                                        void*io,unsigned flags,unsigned*out,unsigned*error){
-    return prepare(s,c,cn,b,bn,d,io,flags,out,error);
+    uintptr_t contextAddress=0;uint64_t contextWords[32]={};
+    if (!deriveLiveContext(s,io,c,cn,b,bn,out,contextAddress,contextWords)) {
+        if (out) *out = 0;
+        if (error) *error = 0xe00002c7u;
+        fprintf(stderr,"HEVC_GEN12_REJECT context_does_not_own_buffers\n");
+        return 0;
+    }
+    if (!error) {
+        if (out) *out = 0;
+        return 0;
+    }
+    return prepare(s,c,cn,b,bn,d,contextAddress,io,flags,out,error);
 }
